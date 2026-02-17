@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+pydantic
+python-multipart
+numpy
+scikit-learn
+librosa
+soundfile
+tldextract
+rapidfuzz
+transformers
+torch
