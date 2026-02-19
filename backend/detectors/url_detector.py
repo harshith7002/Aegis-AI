@@ -1,110 +1,136 @@
-import numpy as np
-import librosa
-import soundfile as sf
-import io
+import re
+import tldextract
+from rapidfuzz.distance import Levenshtein
 
-def analyze_voice(audio_bytes: bytes, filename="audio.wav"):
+TRUSTED_BRANDS = ["barclays", "paypal", "microsoft", "google", "apple", "amazon"]
+SUSPICIOUS_WORDS = [
+    "secure", "verify", "login", "account", "update", "confirm",
+    "wallet", "support", "help", "reset", "password", "signin"
+]
+
+def looks_like_ip(host: str):
+    return bool(re.match(r"^\d{1,3}(\.\d{1,3}){3}$", host))
+
+def analyze_url(url: str):
     reasons = []
     score = 0
+    u = url.lower().strip()
 
-    # Load audio
-    y, sr = sf.read(io.BytesIO(audio_bytes))
-    if y.ndim > 1:
-        y = y.mean(axis=1)
+    # -------------------------
+    # 1) Protocol risk
+    # -------------------------
+    if u.startswith("http://"):
+        score += 25
+        reasons.append("URL uses insecure HTTP")
+    elif u.startswith("https://"):
+        score += 5  # still risk if phishing
 
-    # Convert to float
-    y = y.astype(float)
+    # -------------------------
+    # 2) Extract domain
+    # -------------------------
+    ext = tldextract.extract(u)
+    sub = ext.subdomain.lower()
+    domain = ext.domain.lower()
+    suffix = ext.suffix.lower()
+    full_domain = f"{domain}.{suffix}" if suffix else domain
+    host_full = ".".join([x for x in [sub, domain, suffix] if x])
 
-    duration = len(y) / sr
-
-    # ----------------------------
-    # 1) Basic checks
-    # ----------------------------
-    if duration < 1.5:
-        score += 15
-        reasons.append("Very short sample (low confidence)")
-
-    if sr < 16000:
-        score += 15
-        reasons.append("Low sample rate recording (often compressed calls)")
-
-    # ----------------------------
-    # 2) MFCC Features
-    # ----------------------------
-    mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=20)
-    mfcc_var = np.var(mfcc, axis=1)
-    var_mean = float(np.mean(mfcc_var))
-
-    if var_mean < 12:
-        score += 65
-        reasons.append("Extremely low MFCC variance (strong synthetic indicator)")
-    elif var_mean < 18:
+    # -------------------------
+    # 3) IP address instead of domain
+    # -------------------------
+    if looks_like_ip(domain) or looks_like_ip(host_full):
         score += 45
-        reasons.append("Low MFCC variance (possible synthetic voice)")
+        reasons.append("Uses raw IP address instead of domain")
 
-    # ----------------------------
-    # 3) Spectral features
-    # ----------------------------
-    centroid = librosa.feature.spectral_centroid(y=y, sr=sr)
-    centroid_mean = float(np.mean(centroid))
+    # -------------------------
+    # 4) Suspicious keywords (NO BREAK now)
+    # -------------------------
+    keyword_hits = 0
+    for w in SUSPICIOUS_WORDS:
+        if w in u:
+            keyword_hits += 1
 
-    rolloff = librosa.feature.spectral_rolloff(y=y, sr=sr)
-    rolloff_mean = float(np.mean(rolloff))
+    if keyword_hits > 0:
+        score += min(25, keyword_hits * 8)
+        reasons.append(f"Suspicious keywords in URL ({keyword_hits})")
 
-    if centroid_mean < 1200:
-        score += 15
-        reasons.append("Unnaturally low spectral centroid (flat voice profile)")
-
-    if rolloff_mean < 2500:
-        score += 15
-        reasons.append("Low spectral rolloff (compressed / synthetic-like audio)")
-
-    # ----------------------------
-    # 4) Zero Crossing Rate
-    # ----------------------------
-    zcr = librosa.feature.zero_crossing_rate(y)
-    zcr_mean = float(np.mean(zcr))
-
-    if zcr_mean < 0.03:
-        score += 15
-        reasons.append("Low zero-crossing rate (over-smoothed voice)")
-    elif zcr_mean > 0.18:
+    # -------------------------
+    # 5) Hyphen & long domain tricks
+    # -------------------------
+    if "-" in domain:
         score += 12
-        reasons.append("High zero-crossing rate (possible artifacts / noise)")
+        reasons.append("Hyphenated domain pattern")
 
-    # ----------------------------
-    # 5) RMS energy stability
-    # ----------------------------
-    rms = librosa.feature.rms(y=y)[0]
-    rms_std = float(np.std(rms))
+    if len(domain) >= 18:
+        score += 10
+        reasons.append("Unusually long domain name")
 
-    if rms_std < 0.01:
-        score += 20
-        reasons.append("Unnaturally stable energy (robotic consistency)")
+    # -------------------------
+    # 6) Too many subdomains trick
+    # -------------------------
+    if sub:
+        sub_parts = sub.split(".")
+        if len(sub_parts) >= 2:
+            score += 15
+            reasons.append("Multiple subdomains (possible hiding technique)")
 
-    # ----------------------------
-    # 6) Final boosting rules (important)
-    # ----------------------------
-    # If multiple synthetic signals stack up, push to HIGH.
-    strong_signals = 0
-    if var_mean < 18:
-        strong_signals += 1
-    if rms_std < 0.01:
-        strong_signals += 1
-    if zcr_mean < 0.03:
-        strong_signals += 1
-    if centroid_mean < 1200:
-        strong_signals += 1
+    # -------------------------
+    # 7) Brand spoofing checks
+    # -------------------------
+    # A) Brand in subdomain (classic phishing)
+    for brand in TRUSTED_BRANDS:
+        if brand in sub:
+            score += 35
+            reasons.append(f"Brand name '{brand}' appears in subdomain")
+            break
 
-    if strong_signals >= 3:
+    # B) Domain typosquat (distance <= 2 is better)
+    for brand in TRUSTED_BRANDS:
+        dist = Levenshtein.distance(domain, brand)
+
+        if dist == 1:
+            score += 55
+            reasons.append(f"Very likely typosquatting of '{brand}'")
+            break
+        elif dist == 2:
+            score += 40
+            reasons.append(f"Possible typosquatting of '{brand}'")
+            break
+
+        # C) Brand contained inside domain with extra junk
+        if brand in domain and domain != brand:
+            score += 30
+            reasons.append(f"Brand '{brand}' embedded inside domain")
+            break
+
+    # -------------------------
+    # 8) Suspicious path patterns
+    # -------------------------
+    if any(x in u for x in ["/login", "/signin", "/verify", "/reset", "/update"]):
+        score += 15
+        reasons.append("Suspicious login/verify path detected")
+
+    # -------------------------
+    # 9) URL shorteners
+    # -------------------------
+    if any(x in u for x in ["bit.ly", "tinyurl", "t.co", "goo.gl"]):
+        score += 30
+        reasons.append("URL shortener detected")
+
+    # -------------------------
+    # 10) Final boosts (make HIGH actually happen)
+    # -------------------------
+    if ("login" in u or "verify" in u) and ("secure" in u or "account" in u):
+        score = max(score, 75)
+
+    if "http://" in u and keyword_hits >= 2:
         score = max(score, 80)
-        reasons.append("Multiple synthetic voice indicators stacked")
 
     score = min(100, score)
 
-    # ----------------------------
+    # -------------------------
     # Tier mapping
-    # ----------------------------
+    # -------------------------
     if score >= 75:
         tier = "HIGH"
     elif score >= 40:
@@ -112,18 +138,18 @@ def analyze_voice(audio_bytes: bytes, filename="audio.wav"):
     else:
         tier = "LOW"
 
+    # Label mapping
+    if score >= 75:
+        label = "Phishing URL"
+    elif score >= 40:
+        label = "Spoofing / Suspicious"
+    else:
+        label = "Likely Safe"
+
     return {
+        "domain": full_domain,
+        "label": label,
         "final_risk_score": score,
         "tier": tier,
         "reasons": list(dict.fromkeys(reasons))[:7],
-        "meta": {
-            "filename": filename,
-            "sample_rate": int(sr),
-            "duration_sec": round(duration, 2),
-            "mfcc_var_mean": round(var_mean, 3),
-            "spectral_centroid_mean": round(centroid_mean, 2),
-            "spectral_rolloff_mean": round(rolloff_mean, 2),
-            "zcr_mean": round(zcr_mean, 4),
-            "rms_std": round(rms_std, 6),
-        },
     }
